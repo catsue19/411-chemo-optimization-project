@@ -37,8 +37,11 @@ STEP 1 - THE LOG TRANSFORM (why the problem becomes easy to handle)
         so far - not on WHEN they were given.  This single fact makes dynamic programming work.
 
 STEP 2 - TWO EXACT ALGORITHMS (both are explained in detail next to their code below)
-    * dp_solve        : dynamic programming over the state (k, n).
-    * branch_and_bound: solve LP relaxations, branch on fractional doses, prune with bounds.
+    * dp_solve        : dynamic programming over the state (k, n)  (forward table of reachable states).
+    * dp_backward     : the same DP written as in-class (backward Bellman recursion, stage tables).
+    * branch_and_bound: solve LP relaxations, branch on fractional doses, prune with bounds.  
+                        Options switch our extensions on or off; show_tree=True prints the tree.
+    * weighted_sum    : the weighted-sum method for two objectives (doses, tumour cap).
 
 GLOSSARY (terms you will see in the comments)
     feasible        : satisfies every constraint.
@@ -122,20 +125,35 @@ def closed_form_bound(K, p=DEFAULT):
 #       and so on, each node fixing one more X[j].
 #
 #   At each node we solve a RELAXATION: the same problem but the undecided X[j] may take any
-#   value in [0, 1].  That is an ordinary LP (fast to solve) and gives three possible outcomes:
+#   value in [0, 1].  That is an ordinary LP (fast to solve) and gives four possible outcomes.
+#   The labels (a)-(d) and the abbreviations IFS / NFS / NFI are from in-class:
 #
-#     (a) the LP is INFEASIBLE         -> no schedule in this branch can work -> prune the branch.
-#     (b) the LP's value is no better than the incumbent
-#                                      -> nothing in this branch can beat what we have -> prune.
-#     (c) the LP solution happens to be all 0/1
-#                                      -> it is a real schedule: a new incumbent (best-so-far).
-#     (d) otherwise (some X[j] fractional like 0.37)
-#                                      -> pick the most fractional X[j] and BRANCH on it.
+#     (a) some X[j] is fractional (like 0.37) and there may be room to improve
+#                                      -> pick the most fractional X[j] and BRANCH on it ("fathom").
+#     (b) the LP solution is all 0/1   -> IFS, an integer feasible solution: a real schedule, so it
+#                                         becomes the new incumbent (best so far), then BACKTRACK.
+#     (c) the LP is INFEASIBLE         -> NFS, no feasible solution: nothing in this branch can work.
+#     (d) the LP's value is no better than the incumbent
+#                                      -> NFI, no further improvement possible: prune the branch.
+#     After (b), (c) or (d) we BACKTRACK: go back up and explore the other subproblem.
+#
+#   Our goal is to MINIMIZE the number of doses, so
+#   "bound" means a LOWER bound and (d) means "LP value >= incumbent".  Our variables are 0/1, so
+#   l_k = 0 and the two subproblems are X[j] = 1 and X[j] = 0.  As in-class, we branch on the
+#   variable with the LARGEST fractional part (lowest index on ties) and, with select="depth", visit
+#   the "x >= l+1" child (X[j] = 1) first and backtrack to X[j] = 0.  Setting
+#   use_ceil=False, warm_start=False, select="depth" gives exactly the method used in-class;
+#   show_tree=True prints the tree as a node diagram.
+#
+#   Differences from in-class: the LP at each node is solved by SciPy's HiGHS instead of by hand
+#   with the simplex / two-phase method.  Because the log transform makes every node a LINEAR
+#   program, pruning is valid and the answer is globally optimal (the lecture warns that for
+#   nonconvex problems a node could be pruned wrongly).
 #
 #   When no open nodes remain, the incumbent is PROVEN globally optimal.  The tree is explored
 #   only where it could still matter, which is why B&B is usually far faster than brute force.
 #
-#   Two extra tricks used below:
+#   Two extra tricks used below (NOT in the lectures - extensions we added):
 #     * CEILING CUT: P*(number of doses) can only be a whole number of doses, so a node whose LP
 #       bound is 20.06 can reach at best 21 doses.  We round the bound UP before comparing.
 #     * WARM START : we start from the heuristic schedule as the incumbent, so pruning (b) works
@@ -145,7 +163,8 @@ def closed_form_bound(K, p=DEFAULT):
 #     "best"  : best-first - always take the open node with the smallest LP bound
 #               (the most promising); needs a priority queue.
 #     "depth" : depth-first - keep diving into the most recently created node; finds a full
-#               schedule fast and uses little memory.
+#               schedule fast and uses little memory.  This is the rule taught in-class
+#               ("a depth-first search of the tree is more efficient than breadth-first").
 # -----------------------------------------------------------------------------------------
 def _build_lp(K, p):
     """Build the pieces of the LP relaxation (they are the same at every node; only the BOUNDS
@@ -172,7 +191,7 @@ def _build_lp(K, p):
 
 
 def branch_and_bound(K, p=DEFAULT, use_ceil=True, warm_start=True, select="best",
-                     node_limit=200000, time_limit=60.0, trace=False):
+                     node_limit=200000, time_limit=60.0, trace=False, show_tree=False):
     """Solve the scheduling problem by LP-based branch-and-bound.
 
     Options
@@ -180,6 +199,9 @@ def branch_and_bound(K, p=DEFAULT, use_ceil=True, warm_start=True, select="best"
       warm_start : start with the 'dose only when forced' heuristic as the incumbent.
       select     : "best" (best-first) or "depth" (depth-first) node selection.
       node_limit / time_limit : safety stops; if hit, 'proved' is False (answer may be suboptimal).
+      show_tree  : if True, print one line per node in the style of a tree diagram
+                   (node number, decisions made, LP value, and IFS / NFS / NFI / branch).
+                   Meant for small K with select="depth", use_ceil=False, warm_start=False.
       trace      : if True, record the CONVERGENCE HISTORY (one row per node: incumbent, global
                    lower bound, gap, ...) so we can plot how the search closes the gap.
 
@@ -246,7 +268,7 @@ def branch_and_bound(K, p=DEFAULT, use_ceil=True, warm_start=True, select="best"
 
         event = None                              # what happened at this node (for the trace)
         if res.status != 0:
-            # (a) no solution even with fractional doses -> nothing below this node can be feasible
+            # case (c), NFS: no solution even with fractional doses -> nothing below this node can be feasible
             n_infeasible += 1
             event = "infeasible"
         else:
@@ -256,7 +278,7 @@ def branch_and_bound(K, p=DEFAULT, use_ceil=True, warm_start=True, select="best"
             # Doses are whole numbers, so a branch with bound 20.06 cannot do better than 21.
             lb = math.ceil(bound - 1e-7) if use_ceil else bound
             if lb >= best - 1e-9:
-                # (b) this branch cannot beat the incumbent -> discard it ("prune by bound")
+                # case (d), NFI: this branch cannot beat the incumbent -> discard it ("prune by bound")
                 n_bound += 1
                 event = "pruned_by_bound"
             else:
@@ -264,7 +286,7 @@ def branch_and_bound(K, p=DEFAULT, use_ceil=True, warm_start=True, select="best"
                 frac = np.abs(x - np.rint(x))     # distance of each dose from the nearest whole number
                 j = int(np.argmax(frac))          # index of the MOST fractional dose
                 if frac[j] < 1e-6:
-                    # (c) every dose is 0 or 1 (up to rounding): a genuine schedule
+                    # case (b), IFS: every dose is 0 or 1 (up to rounding): a genuine schedule
                     n_integral += 1
                     event = "integral"
                     X = [int(round(v)) for v in x]
@@ -272,7 +294,8 @@ def branch_and_bound(K, p=DEFAULT, use_ceil=True, warm_start=True, select="best"
                     if feasible(X, p) and sum(X) < best:
                         best, best_X = sum(X), X
                 else:
-                    # (d) branch on dose j: create two children, one with X[j]=0 and one with X[j]=1
+                    # case (a): branch on dose j: create two children, one with X[j]=0 and one with X[j]=1
+                    # (the loop order 0, then 1 means depth-first pops X[j]=1 first)
                     n_branched += 1
                     event = "branched"
                     for val in (0, 1):
@@ -285,6 +308,16 @@ def branch_and_bound(K, p=DEFAULT, use_ceil=True, warm_start=True, select="best"
                         else:
                             open_nodes.append(entry_new)            # depth-first: newest last => popped first
         max_open = max(max_open, len(open_nodes))
+
+        # ---- tree printout (optional) ----
+        if show_tree:
+            label = {"infeasible": "NFS (no feasible solution): fathom",
+                     "pruned_by_bound": "NFI (no further improvement): fathom",
+                     "integral": "IFS (integer feasible solution): backtrack",
+                     "branched": "branch on X%d (= %.3f)" % (j + 1, x[j]) if event == "branched" else ""}[event]
+            decided = ", ".join("X%d=%d" % (k + 1, v) for k, v in fixed.items())
+            val = "" if res.status != 0 else "  f=%.3f" % res.fun
+            print("%snode %d {%s}%s  -> %s" % ("  " * len(fixed), nodes, decided, val, label))
 
         # ---- convergence record: one row per node ----
         if trace:
@@ -386,6 +419,66 @@ def dp_solve(K, p=DEFAULT, keep_table=False):
                 table=reach if keep_table else None)
 
 
+# -----------------------------------------------------------------------------------------
+# THE SAME DP WRITTEN IN THE WAY FROM CLASS CONTENT (backward recursion with one table per stage)
+# -----------------------------------------------------------------------------------------
+# dp_solve above works FORWARD and only records which states are reachable.  In class, we instead
+# works BACKWARD from the last stage with Bellman's principle, and keeps a COST table per stage
+# (the stagecoach tables).  Both give the same optimum.  Mapping to the stagecoach problem:
+#   stage n            <->  period k = 1..K                (the stagecoach has 4 stages, we have K)
+#   state s            <->  n_prev = doses given BEFORE period k.  Together with k it fixes the tumour
+#                           size S0*A^(k-1)*(1-RF)^n_prev, so the past matters only through (k, n_prev):
+#                           the MARKOVIAN property.
+#   decision x_n       <->  x = 0 (no dose) or 1 (dose) in period k
+#   immediate cost C   <->  x   (one dose; multiply by P for money)
+#   f_n(s, x_n)        <->  f_k(n_prev, x) = x + f*_{k+1}(n_prev + x)                Bellman's principle
+#   f*_n(s)            <->  f*_k(n_prev) = min over allowed x of f_k(n_prev, x)
+#   last stage         <->  f*_{K+1}(.) = 0                  nothing left to pay (f*_5(J) = 0)
+#   an impossible move <->  cost = infinity (the tumour would leave [S_MIN, S_TOL])
+# The answer is f*_1(0) = the minimum number of doses from the initial tumour.
+def dp_backward(K, p=DEFAULT, verbose=False):
+    """Backward-recursion DP.  verbose=True prints one table per stage:  s | x=0 | x=1 | f*(s) | x*
+    exactly like the stagecoach tables in from class ("0 or 1" marks a tie, i.e. two optimal choices).
+    Returns dict(doses, X); same optimum as dp_solve (checked in analyze_solution_and_performance.py)."""
+    lam, lnA, lnS0 = -math.log(1 - p["RF"]), math.log(p["A"]), math.log(p["S0"])
+    zL, zU = math.log(p["S_MIN"]) - 1e-12, math.log(p["S_TOL"]) + 1e-12
+
+    def ok(k, n):
+        """Is the size after dosing in period k (1-based) inside [S_MIN, S_TOL] when n doses were given in total?"""
+        return zL <= lnS0 + (k - 1) * lnA - lam * n <= zU
+
+    INF = math.inf
+    f = [[INF] * (K + 2) for _ in range(K + 2)]        # f[k][n_prev]: best cost-to-go from stage k
+    best_x = [[None] * (K + 2) for _ in range(K + 2)]  # x*_k(n_prev): the optimal decision at that state
+    for n in range(K + 1):
+        f[K + 1][n] = 0.0                              # terminal condition f*_{K+1} = 0
+    tables = {}
+    for k in range(K, 0, -1):                          # BACKWARD: stage K first, stage 1 last
+        rows = []
+        for n in range(0, k):                          # at most k-1 doses can precede period k
+            if k > 1 and not ok(k - 1, n):
+                continue                               # this state cannot occur: limits already violated
+            opts = [x + f[k + 1][n + x] if ok(k, n + x) else INF for x in (0, 1)]   # immediate + future cost
+            f[k][n] = min(opts)
+            best_x[k][n] = None if f[k][n] == INF else (0 if opts[0] <= opts[1] else 1)
+            tie = opts[0] == opts[1] != INF
+            rows.append((n, opts[0], opts[1], f[k][n], "0 or 1" if tie else best_x[k][n]))
+        tables[k] = rows
+    if verbose:
+        fmt = lambda v: " inf" if v == INF else "%4d" % v
+        for k in range(K, 0, -1):
+            print("stage k=%d   f_k(s, x) = x + f*_{k+1}(s + x)" % k)
+            print("  s (doses so far) | x=0 | x=1 | f*_k(s) | x*_k")
+            for n, a0, a1, fs, xs in tables[k]:
+                print("  %16d | %s | %s | %7s | %s" % (n, fmt(a0), fmt(a1), "inf" if fs == INF else int(fs), xs))
+    if f[1][0] == INF:
+        return dict(doses=None, X=None)                # infeasible instance
+    X, n = [], 0                                       # walk FORWARD through the optimal policy
+    for k in range(1, K + 1):
+        x = best_x[k][n]; X.append(x); n += x
+    return dict(doses=int(f[1][0]), X=X)
+
+
 def dp_count_optimal(K, p=DEFAULT):
     """Count HOW MANY different schedules attain the optimum (global optima are not unique).
     Same table as dp_solve, but instead of True/False we count the number of ways to reach each state:
@@ -408,3 +501,26 @@ def dp_count_optimal(K, p=DEFAULT):
         if ways[n] > 0:
             return n, int(ways[n])
     return None, 0
+
+
+# =========================================================================================
+# PART 4.  TWO OBJECTIVES: THE WEIGHTED-SUM METHOD (From Class Content)
+# =========================================================================================
+# Objectives: f1 = number of doses, f2 = largest allowed tumour size.  They conflict: a lower cap
+# needs more doses.  For n doses the lowest cap that can be held is S0 * A^(K-1) * (1-RF)^n (checked by
+# bisection on the DP in run_level1_project.py), so the efficient (Pareto-optimal) points are known.
+# The weighted sum minimises  w1*f1 + (1-w1)*f2  and says the objectives must first be scaled to a
+# similar size; here each is divided by its largest value.  We sweep w1 and record which point wins.
+# A point that wins for NO weight lies on a non-convex part of the front, which the weighted sum cannot
+# reach (the epsilon-constraint method used in run_level1_project.py can).
+def weighted_sum(K=52, p=DEFAULT, n_range=range(18, 24), weights=None):
+    """Return (doses, lowest_cap, winners) where winners[n] lists the weights w1 for which n doses is best."""
+    weights = np.linspace(0.0, 1.0, 101) if weights is None else weights
+    n = np.array(list(n_range), float)
+    cap = p["S0"] * p["A"] ** (K - 1) * (1 - p["RF"]) ** n
+    f1, f2 = n / n.max(), cap / cap.max()               # scale to comparable size
+    winners = {}
+    for w in weights:
+        i = int(np.argmin(w * f1 + (1 - w) * f2))
+        winners.setdefault(int(n[i]), []).append(round(float(w), 2))
+    return n, cap, winners
